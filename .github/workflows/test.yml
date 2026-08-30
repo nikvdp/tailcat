@@ -39,13 +39,31 @@ jobs:
       # the macOS test job, whose e2e tests build a tagged binary.)
       - name: cross-build cmd/tailcat with release build tags
         run: |
+          set -euo pipefail
           tags=$(cat build-tags.txt)
           echo "release tags: $tags"
-          GOOS=linux   GOARCH=amd64         go build -o /dev/null -tags "$tags" ./cmd/tailcat
-          GOOS=linux   GOARCH=arm64         go build -o /dev/null -tags "$tags" ./cmd/tailcat
-          GOOS=linux   GOARCH=arm  GOARM=7  go build -o /dev/null -tags "$tags" ./cmd/tailcat
-          GOOS=windows GOARCH=amd64         go build -o /dev/null -tags "$tags" ./cmd/tailcat
-          GOOS=windows GOARCH=arm64         go build -o /dev/null -tags "$tags" ./cmd/tailcat
+          # Keep in sync with the targets list in .goreleaser.yaml.
+          targets="
+          linux/amd64
+          linux/arm64
+          linux/arm/7
+          linux/riscv64
+          darwin/amd64
+          darwin/arm64
+          windows/amd64
+          windows/arm64
+          freebsd/amd64
+          freebsd/arm64
+          openbsd/amd64
+          openbsd/arm64
+          "
+          echo "$targets" | while read -r t; do
+            [ -n "$t" ] || continue
+            IFS=/ read -r goos goarch goarm <<< "$t"
+            echo "building $goos/$goarch${goarm:+ (GOARM=$goarm)}"
+            GOOS="$goos" GOARCH="$goarch" GOARM="$goarm" \
+              go build -o /dev/null -tags "$tags" ./cmd/tailcat
+          done
   wasm:
     runs-on: ubuntu-latest
     steps:
