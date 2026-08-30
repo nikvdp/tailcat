@@ -1,16 +1,19 @@
 name: Release
 
-# Two paths, picked apart by github.event_name below:
+# This fork tracks upstream main by rebasing our two commits on top of
+# it, and publishes binaries for platforms upstream doesn't cover. Two
+# independent jobs:
 #
-#   push of a v* tag  -> build whatever tree the tag points at
-#   schedule / manual -> mirror upstream releases missing here
+#   sync      -> rebase main onto upstream main (no build, no release)
+#   release   -> build+publish, only for upstream releases we lack
 #
-# This fork exists only to publish binaries for platforms upstream
-# doesn't cover, so no container images are built (see .goreleaser.yaml,
-# which has no dockers_v2 section).
+# No container images are built; see .goreleaser.yaml, which has no
+# dockers_v2 section.
 on:
+  # Any push to main (including sync's own rebase) re-evaluates both
+  # jobs, so a fresh upstream release gets built right after syncing.
   push:
-    tags: ["v*"]
+    branches: [main]
   # Public repos have scheduled workflows auto-disabled after 60 days
   # without repository activity; any push revives them.
   schedule:
@@ -19,40 +22,134 @@ on:
     inputs:
       upstream_tag:
         description: >-
-          Upstream release to mirror (e.g. v0.3.0). Leave empty to
-          mirror every unmirrored upstream release, oldest first.
+          Upstream release to build (e.g. v0.3.0). Leave empty to build
+          every unbuilt upstream release, oldest first.
         required: false
 
 permissions:
   contents: write
 
 jobs:
-  # Mirror upstream releases this fork doesn't have yet.
+  # Keep main as: upstream main + our commits on top.
   #
-  # Scheduled runs always execute the default branch, so this checks
-  # out main to pick up the current .goreleaser.yaml, then re-points
-  # the worktree at the exact commit upstream tagged. Releases can lag
-  # upstream main, so building main would ship code that no upstream
-  # release ever contained.
+  # Rebasing rewrites our commits' SHAs, so this force-pushes. That is
+  # safe only because the rebase is a pure replay: if it conflicts, the
+  # job aborts, force-pushes nothing, and opens an issue instead. Never
+  # resolves conflicts automatically -- that would silently drop or
+  # mangle the release config.
   sync:
-    if: github.event_name != 'push'
+    if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          # Full history: git rebase --onto needs the merge base, and
+          # the fork's default shallow clone (depth 1) has none.
+          fetch-depth: 0
+
+      - name: add upstream remote
+        run: git remote add upstream https://github.com/tailscale/tailcat
+
+      - name: fetch upstream
+        run: git fetch upstream main
+
+      # Our commits, identified by subject rather than SHA: a rebase
+      # rewrites SHAs but preserves subjects, and these two are the
+      # only commits on main that aren't upstream's.
+      - name: find our commits
+        id: ours
+        run: |
+          set -euo pipefail
+          base=$(git merge-base upstream/main main)
+          mapfile -t ours < <(git log --reverse --format=%H "$base..main")
+          if [ "${#ours[@]}" -eq 0 ]; then
+            echo "::error::main has no commits on top of upstream/main"
+            exit 1
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "Rebasing ${#ours[@]} commit(s) onto upstream/main:"
+          for c in "${ours[@]}"; do
+            echo "  $(git log -1 --format='%h %s' "$c")"
+          done
+
+      - name: rebase
+        id: rebase
+        run: |
+          set -euo pipefail
+          if git rebase --onto upstream/main "${{ steps.ours.outputs.base }}" main; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git rebase --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "Rebase conflicted; left main untouched."
+          fi
+
+      - name: report conflict
+        if: steps.rebase.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          title="Rebase onto upstream failed; manual fix needed"
+          body=$(cat <<'EOF'
+          The sync job could not rebase this fork's commits onto
+          `tailscale/tailcat` main, so main is now behind upstream.
+
+          Rebase it locally and force-push:
+
+          ```sh
+          git remote add upstream https://github.com/tailscale/tailcat
+          git fetch upstream
+          git rebase --onto upstream/main <upstream-base> main
+          git push --force-with-lease origin main
+          ```
+          EOF
+          )
+          # Reuse an existing open issue rather than spamming new ones.
+          num=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -z "$num" ]; then
+            gh issue create --title "$title" --body "$body"
+          else
+            gh issue comment "$num" --body "Still failing as of $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+          fi
+
+      - name: push
+        if: steps.rebase.outputs.conflict == 'false'
+        run: |
+          set -euo pipefail
+          # Rebasing rewrites SHAs, so this is a force push.
+          # --force-with-lease refuses if someone else pushed since the
+          # checkout, so a concurrent push can't be clobbered.
+          git push --force-with-lease origin main
+
+  # Build and publish upstream releases this fork doesn't have yet.
+  # Gated on upstream's releases, not on upstream's commits: upstream
+  # merges to main far more often than it cuts a release, and only
+  # releases should produce artifacts here.
+  release:
+    needs: sync
+    # Run unless sync failed outright (a conflict is a sync failure,
+    # and building a stale tree then would ship the wrong code).
+    if: always() && needs.sync.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          fetch-depth: 1
+          fetch-depth: 0
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      # Same pinned version as the goreleaser job below. install-only
-      # because the mirror step loops over releases and needs the
-      # binary on PATH, not a single action invocation.
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           version: "~> v2"
           install-only: true
-      - name: find unmirrored upstream releases
+
+      - name: find unbuilt upstream releases
         id: pending
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -71,21 +168,22 @@ jobs:
             fi
             all="$WANTED"
           fi
-          # comm wants sorted input; -13 keeps upstream-only tags.
+          # comm needs sorted input; -13 keeps upstream-only tags.
+          # Unsorted upstream order, so emit oldest-listed last.
           pending=$(comm -13 <(echo "$have" | sort) <(echo "$all" | sort))
           if [ -z "$pending" ]; then
             echo "tags=" >> "$GITHUB_OUTPUT"
-            echo "Nothing to mirror; up to date with upstream."
+            echo "No new upstream releases to build."
             exit 0
           fi
-          echo "Unmirrored upstream releases: $(echo "$pending" | tr '\n' ' ')"
+          echo "Unbuilt upstream releases: $(echo "$pending" | tr '\n' ' ')"
           {
             echo "tags<<TAGS_EOF"
             echo "$pending"
             echo "TAGS_EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: mirror each pending release
+      - name: build each pending release
         if: steps.pending.outputs.tags != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -93,25 +191,29 @@ jobs:
           set -euo pipefail
           while read -r tag; do
             [ -n "$tag" ] || continue
-            echo "=== mirroring upstream $tag ==="
+            echo "=== building upstream $tag ==="
+            # Resolve the tagged commit, then fetch it. A shallow
+            # fetch keeps the run fast; the build needs no history.
             sha=$(gh api "repos/tailscale/tailcat/commits/$tag" --jq '.sha')
             git fetch --depth 1 https://github.com/tailscale/tailcat "$sha"
             git checkout --force "$sha"
-            # Overlay this fork's release config; everything else in
-            # the tree is upstream's release code.
-            git checkout main -- .goreleaser.yaml
+            # Overlay this fork's release config on upstream's release
+            # code. "origin" here is wherever actions/checkout pointed,
+            # and the fork's config lives on its own main, so fetch it
+            # explicitly rather than assuming a local branch exists.
+            git fetch --depth 1 origin main
+            git checkout FETCH_HEAD -- .goreleaser.yaml
 
-            # A shallow detached checkout has no tag history, so
-            # GoReleaser's changelog comes out empty. Write the notes
-            # ourselves and point at upstream's release page.
+            # A detached checkout has no tag history for the changelog,
+            # and GoReleaser's would come out empty, so write notes.
             {
               echo "Mirrored build of upstream [$tag](https://github.com/tailscale/tailcat/releases/tag/$tag)."
               echo
               echo "Built from upstream commit \`$sha\` with this fork's"
               echo "[\`.goreleaser.yaml\`](https://github.com/$GITHUB_REPOSITORY/blob/main/.goreleaser.yaml),"
               echo "which adds release targets upstream does not publish"
-              echo "(macOS, FreeBSD, OpenBSD, Linux riscv64). The Linux and"
-              echo "Windows binaries match upstream's; the rest are"
+              echo "(macOS, FreeBSD, OpenBSD, Linux riscv64). The Linux"
+              echo "and Windows binaries match upstream's; the rest are"
               echo "additions, not re-builds."
               echo
               echo "See the [upstream release](https://github.com/tailscale/tailcat/releases/tag/$tag)"
@@ -125,21 +227,3 @@ jobs:
               goreleaser release --clean --skip=validate \
                 --release-notes=/tmp/notes.md
           done <<< "${{ steps.pending.outputs.tags }}"
-
-  # Build and publish whatever tree a pushed v* tag points at.
-  goreleaser:
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0 # for the changelog
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
-        with:
-          version: "~> v2"
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
