@@ -186,7 +186,11 @@ jobs:
       - name: build each pending release
         if: steps.pending.outputs.tags != ''
         env:
+          # gh reads GH_TOKEN; goreleaser reads GITHUB_TOKEN and fails
+          # outright without it ("missing GITHUB_TOKEN, GITLAB_TOKEN
+          # and GITEA_TOKEN"), so both are needed here.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           while read -r tag; do
