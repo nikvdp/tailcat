@@ -56,9 +56,13 @@ $ docker pull ghcr.io/tailscale/tailcat:v0.1.0  # or :latest
 $ docker run --rm -it ghcr.io/tailscale/tailcat:latest
 ```
 
-For macOS, we hope to be in Homebrew soon
-([#28](https://github.com/tailscale/tailcat/issues/28)); until then,
-build from source with a Go toolchain:
+For macOS, install with [Homebrew](https://brew.sh/):
+
+```sh
+$ brew install tailcat
+```
+
+Or build from source with a Go toolchain:
 
 ```sh
 $ go install github.com/tailscale/tailcat/cmd/tailcat@latest
@@ -132,7 +136,7 @@ $
 Or you can serve a local TCP port, forwarded to localhost:
 
 ```sh
-$ tailcat --serve=8080,8443 # or --serve=all
+$ tailcat serve 8080,8443 # or: tailcat serve all
 # 🐈 Server listening with new address: tcXXXXXXXXX
 ```
 
@@ -149,10 +153,10 @@ HTTP/1.1 200 OK
 
 ### Auth-free SSH server
 
-On Linux and macOS, you can run an SSH server too with no auth. (If you want auth, you can just `tailcat --serve=22` and proxy to your system SSH server)
+On Linux and macOS, you can run an SSH server too with no auth. (If you want auth, you can just `tailcat serve 22` and proxy to your system SSH server)
 
 ```sh
-$ tailcat --serve=no-auth-ssh
+$ tailcat serve no-auth-ssh
 # 🐈 Server listening with new address: tcXXXXXXXXX
 ```
 
@@ -162,6 +166,55 @@ And on the client side:
 $ tailcat ssh tcXXXXXXXXX
 $ tailcat ssh tcXXXXXXXXX ls -la
 ```
+
+### Send and receive files
+
+To receive files, run a drop box and share the printed address:
+
+```sh
+$ tailcat recv ~/inbox
+# 🐈 Server listening with new address: tcXXXXXXXXX
+```
+
+The sender then runs:
+
+```sh
+$ tailcat cp report.pdf tcXXXXXXXXX:
+```
+
+`tailcat cp` runs the system `scp` with the connection routed through
+tailcat, so you get its usual progress display, and `-r` for
+directory trees. The drop box is write-only: senders can't list the
+directory, read anything back, or touch existing files.
+
+To offer files instead, serve a directory read-only (the default) or
+read-write:
+
+```sh
+$ tailcat serve files                  # current directory, read-only
+$ tailcat serve --files=/pub:rw files  # a given directory, read-write
+```
+
+```sh
+$ tailcat ls -l tcXXXXXXXXX
+$ tailcat cp tcXXXXXXXXX:report.pdf .
+```
+
+`tailcat ls` speaks SFTP natively, so it works even without OpenSSH
+installed.
+
+The server confines all paths to the served directory (via Go's
+`os.Root`), so neither `..` nor symlinks escape it. The file service
+speaks SFTP, so the stock `sftp` and `scp` clients also work against
+it, given a ProxyCommand that pipes through tailcat (the same trick
+`tailcat cp` and `tailcat ssh` use). A `no-auth-ssh` server serves
+SFTP too, with the same access as the shell.
+
+Transfers are not compressed: the SFTP protocol has no compression
+of its own, and the SSH transport here doesn't either (Go's SSH
+stack omits it; transport compression has a history of security
+problems, and TLS dropped it too). Compress files before sending
+if it matters.
 
 ### Misc commands 
 
@@ -194,7 +247,7 @@ $ tailcat socks curl http://<token>:8081/
 Act as an exit node so the client can reach the server's network:
 
 ```sh
-$ tailcat --serve=exit-node
+$ tailcat serve exit-node
 ```
 
 Parse a connection token and print its contents (the server's WireGuard
@@ -238,7 +291,7 @@ $ tailcat parse tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFygaFhToGjYW
 ```
 
 A server can print the long self-contained form directly with the
-`--full-address` flag.
+`tailcat serve --full-address` flag.
 
 ## Key Management
 
@@ -253,22 +306,23 @@ the key you use determines who can reach you:
 * **Saved keys:** `tailcat genkey` generates a key saved to disk so the
   address stays stable across restarts. The flip side: anyone you've *ever*
   shared that address with can connect to any future server using that key,
-  unless you restrict clients with `--allow` (see `tailcat genkey --client`).
+  unless you restrict clients with `tailcat serve --allow` (see
+  `tailcat genkey --client`).
 
 The CLI says at startup which kind it's using, so you know whether you're
 starting a fresh single-use server or re-listening on an address you may
 have shared in the past.
 
 ```sh
-$ tailcat genkey --region=nyc
+$ tailcat genkey --key=default --region=nyc
 # prints the token; key saved to ~/.config/tailcat/keys/default.private.json
 
 # later; the key named "default" is used automatically once it exists:
-$ tailcat --serve=8080
+$ tailcat serve 8080
 # 🐈 Server listening with saved key "default": tcXXXXXXXXX
 
 # ... unless you force a one-off ephemeral key:
-$ tailcat --serve=8080 --key=new
+$ tailcat serve --key=new 8080
 # 🐈 Server listening with new address: tcXXXXXXXXX
 ```
 
@@ -302,7 +356,7 @@ On the client machine, generate a client identity keypair. It prints
 the public key, which is all the server needs to know:
 
 ```sh
-client$ tailcat genkey --client
+client$ tailcat genkey --client --key=client-default
 # wrote file to ~/.config/tailcat/keys/client-default.private.json
 nodekey:cfb6bfa77a0654d7450947fd6acef17d2cd848da1d30b2540b13dac272ddfd16
 ```
@@ -311,11 +365,11 @@ On the server, generate a server keypair pinned to its nearest DERP
 region (see why below), then serve SSH to only that client:
 
 ```sh
-server$ tailcat genkey --fixed-region
+server$ tailcat genkey --key=default --fixed-region
 # wrote file to ~/.config/tailcat/keys/default.private.json
 tcXXXXXXXXX
 
-server$ tailcat --serve=22 --allow=nodekey:cfb6bf...ddfd16
+server$ tailcat serve --allow=nodekey:cfb6bf...ddfd16 22
 # 🐈 Server listening with saved key "default": tcXXXXXXXXX
 ```
 
@@ -339,7 +393,7 @@ server, or even learn that one is running.
 Why `--fixed-region`: it discovers the nearest DERP region once, at
 genkey time, and bakes its ID into both the printed token and the
 saved key file, so server restarts bind to the same region (keeping
-the published token valid) without re-probing. Plain `tailcat genkey`
+the published token valid) without re-probing. Otherwise genkey
 defaults to `--region=auto`, which instead bakes in "pick at
 startup": fine for one-off use, but a token published in DNS should
 name a fixed region so clients and future server restarts all
@@ -358,10 +412,10 @@ itself via Let's Encrypt), then generate a server key that uses it by
 passing its hostname (or several, comma-separated) as the region:
 
 ```sh
-server$ tailcat genkey --region=derp.example.com
+server$ tailcat genkey --key=default --region=derp.example.com
 tcomFwWCCAIsKOqPUux6ClG2RM4A_vOq4VBzGgHGGjq9OsJuFKSWFygaFhToGhYWhwZGVycC5leGFtcGxlLmNvbQ
 
-server$ tailcat --serve=22
+server$ tailcat serve 22
 ```
 
 The token embeds your relay's hostname:
@@ -468,7 +522,7 @@ followed by base64-encoded [CBOR](https://cbor.io/) containing:
 - A separate path-discovery public key (Curve25519, 32 bytes)
 - DERP info. Either:
   1. a small integer referencing one of the default [Tailscale-run tailcat servers](https://tailcat.dev/derpmap.json), or
-  2. full DERP server metadata, to either use a custom DERP server, or to avoid the client needing a potential round-trip to fetch the latest DERP map (the server's `--full-address` flag and the `tailcat resolve` subcommand produce this form)
+  2. full DERP server metadata, to either use a custom DERP server, or to avoid the client needing a potential round-trip to fetch the latest DERP map (the `tailcat serve --full-address` flag and the `tailcat resolve` subcommand produce this form)
 
 A typical token with just an integer region ID is around 95 bytes. With embedded
 DERP node details it's longer but self-contained.

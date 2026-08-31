@@ -6,37 +6,67 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"flag"
 	"fmt"
 	"log"
 	"net/netip"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
-	"syscall"
 
+	"github.com/peterbourgon/ff/v4"
 	"github.com/tailscale/tailcat"
-	"tailscale.com/types/logger"
 )
 
 const tailCatSSHEnabled = true
 
-func clientSSHMode(logf logger.Logf) {
-	args := flag.Args()
-	args = args[1:] // trim off "ssh"
-	if len(args) == 0 {
-		usage("tailcat ssh [-p <port|ip:port>] [user@]<addrblob> [command ...]")
-	}
+const sshLongHelp = `Examples:
 
-	portOrIPPort := "22"
-	if len(args) >= 2 && args[0] == "-p" {
-		portOrIPPort = args[1]
-		args = args[2:]
-		if ip, err := netip.ParseAddr(portOrIPPort); err == nil {
-			portOrIPPort = netip.AddrPortFrom(ip, 22).String()
-		}
+	tailcat ssh <addrblob>
+	tailcat ssh root@<addrblob>
+	tailcat ssh <addrblob> uptime
+	tailcat ssh example.com
+	tailcat ssh -p 2222 <addrblob>
+	tailcat ssh -p 10.0.0.1:22 <addrblob>
+
+This execs the system ssh client with a ProxyCommand that runs
+tailcat itself, so ssh sees a normal (if oddly named) destination
+while the connection actually goes over tailcat to the server.
+Anything after the destination is passed through to ssh, like a
+remote command to run.
+A DNS name whose "tailcat=" TXT record holds an address blob works
+as the destination too.
+
+The -p flag is the server port to connect to (default 22), or, if
+the server is an exit node (--serve=exit-node), an ip:port on the
+server's network to reach through it; a bare IP means its port 22.`
+
+// sshCommand returns the "tailcat ssh" subcommand, with parent as the
+// parent flag set for the global flags.
+func sshCommand(parent *ff.FlagSet) *ff.Command {
+	fs := ff.NewFlagSet("ssh").SetParent(parent)
+	port := fs.StringShort('p', "22", "port number, or ip:port to reach via the server's exit node; a bare IP means port 22 on it")
+	return &ff.Command{
+		Name:      "ssh",
+		Usage:     "tailcat ssh [-p <port|ip:port>] [user@]<addrblob> [<command> [args...]]",
+		ShortHelp: "connect the system ssh client through a tailcat server",
+		LongHelp:  sshLongHelp,
+		Flags:     fs,
+		Exec: func(ctx context.Context, args []string) error {
+			return clientSSHMode(*port, args)
+		},
+	}
+}
+
+func clientSSHMode(portOrIPPort string, args []string) error {
+	if len(args) == 0 {
+		return usagef("ssh requires a [user@]<addrblob> destination argument")
+	}
+	if ip, err := netip.ParseAddr(portOrIPPort); err == nil {
+		portOrIPPort = netip.AddrPortFrom(ip, 22).String()
 	}
 	dst := args[0] // either a derpaddr alone or "user@<derpaddr>"
 	cmdArgs := args[1:]
@@ -62,21 +92,35 @@ func clientSSHMode(logf logger.Logf) {
 		sshExe,
 		"-o", "UpdateHostKeys no",
 		"-o", "StrictHostKeyChecking no",
-		"-o", "UserKnownHostsFile /dev/null",
+		"-o", "UserKnownHostsFile " + os.DevNull,
 		"-o", "LogLevel ERROR",
 		"-o", "ProxyCommand=" + sshProxyCommand(exe, *flagKey, *flagDERPMapURL, connBlobStr, portOrIPPort),
 		sshDst,
 	}
 	argv = append(argv, cmdArgs...)
-	err = syscall.Exec(sshExe, argv, os.Environ())
-	log.Fatalf("failed to exec: %v", err)
+	err = execSSH(sshExe, argv)
+	log.Fatalf("failed to run ssh: %v", err)
+	return nil
 }
 
 // sshProxyCommand returns the command passed to OpenSSH to connect the SSH
 // client to a tailcat server. The command is run by OpenSSH, so values that
 // can contain shell-special characters must be quoted.
 func sshProxyCommand(exe, keyName, derpMapURL, connBlob, portOrIPPort string) string {
-	cmd := fmt.Sprintf("%s --key=%q", exe, keyName)
+	if runtime.GOOS == "windows" {
+		// Plain quotes without Go's %q backslash escaping: the
+		// executable is a Windows path whose backslashes must survive
+		// both cmd.exe (which Win32-OpenSSH uses to run ProxyCommand)
+		// and the child's own command line parsing.
+		exe = "\"" + exe + "\""
+	}
+	cmd := exe
+	// No --key flag at all when unset: the shell turns --key="" into
+	// --key=, which ff parses by consuming the next argument (the
+	// address blob) as the flag's value.
+	if keyName != "" {
+		cmd += fmt.Sprintf(" --key=%q", keyName)
+	}
 	if derpMapURL != tailcat.DefaultDERPMapURL {
 		cmd += fmt.Sprintf(" --derpmap-url=%q", derpMapURL)
 	}

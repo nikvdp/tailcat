@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build ts_omit_ssh || !(linux || darwin)
+//go:build ts_omit_ssh || !(linux || darwin || windows)
 
 package tailcat
 
@@ -15,4 +15,10 @@ func SupportsSSHServer() bool { return false }
 
 func (s *Server) HandleTailscaleSSHConn(c net.Conn) {
 	c.Close()
+}
+
+// SSHConnHandler returns a handler that closes the connection; the
+// SSH server is not supported on this platform or build.
+func (s *Server) SSHConnHandler(opts SSHOptions) func(net.Conn) {
+	return func(c net.Conn) { c.Close() }
 }

@@ -6,6 +6,7 @@
 package main
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 
@@ -20,17 +21,30 @@ func TestSSHProxyCommandDERPMap(t *testing.T) {
 		port = "22"
 		url  = "https://derp.example.com/derpmap.json"
 	)
+	wantExe := exe
+	if runtime.GOOS == "windows" {
+		wantExe = `"` + exe + `"`
+	}
 
 	got := sshProxyCommand(exe, key, url, blob, port)
-	want := exe + ` --key="client-default" --derpmap-url="https://derp.example.com/derpmap.json" tc-short-blob 22`
+	want := wantExe + ` --key="client-default" --derpmap-url="https://derp.example.com/derpmap.json" tc-short-blob 22`
 	if got != want {
 		t.Errorf("sshProxyCommand with custom DERP map = %q; want %q", got, want)
 	}
 
 	got = sshProxyCommand(exe, key, tailcat.DefaultDERPMapURL, blob, port)
-	want = exe + ` --key="client-default" tc-short-blob 22`
+	want = wantExe + ` --key="client-default" tc-short-blob 22`
 	if got != want {
 		t.Errorf("sshProxyCommand with default DERP map = %q; want %q", got, want)
+	}
+
+	// No --key flag at all when unset. The shell would collapse
+	// --key="" to --key=, which ff parses by consuming the next
+	// argument, the address blob.
+	got = sshProxyCommand(exe, "", tailcat.DefaultDERPMapURL, blob, port)
+	want = wantExe + ` tc-short-blob 22`
+	if got != want {
+		t.Errorf("sshProxyCommand with no key = %q; want %q", got, want)
 	}
 }
 
