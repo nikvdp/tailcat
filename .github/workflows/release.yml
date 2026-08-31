@@ -1,17 +1,23 @@
 name: Release
 
-# This fork tracks upstream main by rebasing our commits on top of
-# it, and publishes binaries for platforms upstream doesn't cover. Two
-# independent jobs:
+# This fork tracks upstream main and publishes binaries for platforms
+# upstream doesn't cover. Two jobs:
 #
-#   sync      -> rebase main onto upstream main (no build, no release)
+#   sync      -> snapshot upstream main, overlay our release files
 #   release   -> build+publish, only for upstream releases we lack
 #
 # No container images are built; see .goreleaser.yaml, which has no
 # dockers_v2 section.
+#
+# GITHUB_TOKEN cannot create or update workflow files, and upstream
+# often touches .github/workflows. Rebasing those commits onto this
+# fork is therefore impossible without a PAT. Instead, sync writes
+# one fast-forward commit: upstream's tree plus this fork's
+# .github/workflows and .goreleaser.yaml. Those paths do not change
+# in the push, so the default token is enough.
 on:
-  # Any push to main (including sync's own rebase) re-evaluates both
-  # jobs, so a fresh upstream release gets built right after syncing.
+  # Any push to main (including sync's own snapshot) re-evaluates
+  # both jobs; the bot push itself skips sync to avoid a loop.
   push:
     branches: [main]
   # Public repos have scheduled workflows auto-disabled after 60 days
@@ -30,13 +36,8 @@ permissions:
   contents: write
 
 jobs:
-  # Keep main as: upstream main + our commits on top.
-  #
-  # Rebasing rewrites our commits' SHAs, so this force-pushes. That is
-  # safe only because the rebase is a pure replay: if it fails, the
-  # job aborts and force-pushes nothing. Never resolves conflicts
-  # automatically -- that would silently drop or mangle the release
-  # config.
+  # Keep main as: upstream's tree + this fork's release files.
+  # Fast-forward only; never force-push.
   sync:
     if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
@@ -44,8 +45,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          # Full history: git rebase --onto needs the merge base, and
-          # the fork's default shallow clone (depth 1) has none.
           fetch-depth: 0
 
       - name: add upstream remote
@@ -54,46 +53,27 @@ jobs:
       - name: fetch upstream
         run: git fetch upstream main
 
-      # Our commits, identified by the range after the merge-base: a
-      # rebase rewrites SHAs, and these are the only commits on main
-      # that aren't upstream's.
-      - name: find our commits
-        id: ours
+      - name: overlay fork files onto upstream
         run: |
           set -euo pipefail
-          base=$(git merge-base upstream/main main)
-          mapfile -t ours < <(git log --reverse --format=%H "$base..main")
-          if [ "${#ours[@]}" -eq 0 ]; then
-            echo "::error::main has no commits on top of upstream/main"
-            exit 1
-          fi
-          echo "base=$base" >> "$GITHUB_OUTPUT"
-          echo "Rebasing ${#ours[@]} commit(s) onto upstream/main:"
-          for c in "${ours[@]}"; do
-            echo "  $(git log -1 --format='%h %s' "$c")"
-          done
-
-      - name: rebase
-        run: |
-          set -euo pipefail
-          # Rebase rewrites commits and needs an identity. The runner
-          # has none by default, which git treats as a rebase failure.
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git rebase --onto upstream/main "${{ steps.ours.outputs.base }}" main; then
+
+          git read-tree upstream/main
+          git rm -r --cached --ignore-unmatch --force .github/workflows >/dev/null
+          # HEAD is still this fork's main: read-tree only swapped the
+          # index. Restore our workflow files and GoReleaser config so
+          # the pushed tree does not create or update them.
+          git restore --source=HEAD --staged -- .github/workflows .goreleaser.yaml
+          tree=$(git write-tree)
+          if [ "$tree" = "$(git rev-parse 'HEAD^{tree}')" ]; then
+            echo "Already synced to upstream $(git rev-parse --short upstream/main)."
             exit 0
           fi
-          git rebase --abort || true
-          echo "::error::rebase onto upstream/main failed; main left untouched"
-          exit 1
 
-      - name: push
-        run: |
-          set -euo pipefail
-          # Rebasing rewrites SHAs, so this is a force push.
-          # --force-with-lease refuses if someone else pushed since the
-          # checkout, so a concurrent push can't be clobbered.
-          git push --force-with-lease origin main
+          msg="sync: tailscale/tailcat $(git rev-parse --short upstream/main)"
+          commit=$(git commit-tree "$tree" -p HEAD -m "$msg")
+          git push origin "$commit":refs/heads/main
 
   # Build and publish upstream releases this fork doesn't have yet.
   # Gated on upstream's releases, not on upstream's commits: upstream
@@ -101,7 +81,7 @@ jobs:
   # releases should produce artifacts here.
   release:
     needs: sync
-    # Skip if sync failed (a failed rebase leaves main stale, and
+    # Skip if sync failed (a failed overlay leaves main stale, and
     # building that tree would ship the wrong code).
     if: needs.sync.result == 'success'
     runs-on: ubuntu-latest
