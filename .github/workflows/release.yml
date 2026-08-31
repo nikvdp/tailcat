@@ -32,6 +32,13 @@ on:
           every unbuilt upstream release, oldest first.
         required: false
 
+# One publisher at a time. A push (from git push, or from sync's own
+# snapshot) already runs this workflow; dispatching at the same time
+# builds the same missing tag twice and the loser dies on
+# already_exists asset uploads.
+concurrency:
+  group: release
+  cancel-in-progress: false
 permissions:
   contents: write
 
