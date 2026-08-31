@@ -1,6 +1,6 @@
 name: Release
 
-# This fork tracks upstream main by rebasing our two commits on top of
+# This fork tracks upstream main by rebasing our commits on top of
 # it, and publishes binaries for platforms upstream doesn't cover. Two
 # independent jobs:
 #
@@ -33,16 +33,13 @@ jobs:
   # Keep main as: upstream main + our commits on top.
   #
   # Rebasing rewrites our commits' SHAs, so this force-pushes. That is
-  # safe only because the rebase is a pure replay: if it conflicts, the
-  # job aborts, force-pushes nothing, and opens an issue instead. Never
-  # resolves conflicts automatically -- that would silently drop or
-  # mangle the release config.
+  # safe only because the rebase is a pure replay: if it fails, the
+  # job aborts and force-pushes nothing. Never resolves conflicts
+  # automatically -- that would silently drop or mangle the release
+  # config.
   sync:
     if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -57,9 +54,9 @@ jobs:
       - name: fetch upstream
         run: git fetch upstream main
 
-      # Our commits, identified by subject rather than SHA: a rebase
-      # rewrites SHAs but preserves subjects, and these two are the
-      # only commits on main that aren't upstream's.
+      # Our commits, identified by the range after the merge-base: a
+      # rebase rewrites SHAs, and these are the only commits on main
+      # that aren't upstream's.
       - name: find our commits
         id: ours
         run: |
@@ -77,48 +74,20 @@ jobs:
           done
 
       - name: rebase
-        id: rebase
         run: |
           set -euo pipefail
+          # Rebase rewrites commits and needs an identity. The runner
+          # has none by default, which git treats as a rebase failure.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if git rebase --onto upstream/main "${{ steps.ours.outputs.base }}" main; then
-            echo "conflict=false" >> "$GITHUB_OUTPUT"
-          else
-            git rebase --abort
-            echo "conflict=true" >> "$GITHUB_OUTPUT"
-            echo "Rebase conflicted; left main untouched."
+            exit 0
           fi
-
-      - name: report conflict
-        if: steps.rebase.outputs.conflict == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          title="Rebase onto upstream failed; manual fix needed"
-          body=$(cat <<'EOF'
-          The sync job could not rebase this fork's commits onto
-          `tailscale/tailcat` main, so main is now behind upstream.
-
-          Rebase it locally and force-push:
-
-          ```sh
-          git remote add upstream https://github.com/tailscale/tailcat
-          git fetch upstream
-          git rebase --onto upstream/main <upstream-base> main
-          git push --force-with-lease origin main
-          ```
-          EOF
-          )
-          # Reuse an existing open issue rather than spamming new ones.
-          num=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')
-          if [ -z "$num" ]; then
-            gh issue create --title "$title" --body "$body"
-          else
-            gh issue comment "$num" --body "Still failing as of $(date -u +%Y-%m-%dT%H:%M:%SZ)."
-          fi
+          git rebase --abort || true
+          echo "::error::rebase onto upstream/main failed; main left untouched"
+          exit 1
 
       - name: push
-        if: steps.rebase.outputs.conflict == 'false'
         run: |
           set -euo pipefail
           # Rebasing rewrites SHAs, so this is a force push.
@@ -132,9 +101,9 @@ jobs:
   # releases should produce artifacts here.
   release:
     needs: sync
-    # Run unless sync failed outright (a conflict is a sync failure,
-    # and building a stale tree then would ship the wrong code).
-    if: always() && needs.sync.result == 'success'
+    # Skip if sync failed (a failed rebase leaves main stale, and
+    # building that tree would ship the wrong code).
+    if: needs.sync.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
