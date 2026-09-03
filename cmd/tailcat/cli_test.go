@@ -12,7 +12,43 @@ import (
 
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
+	"github.com/tailscale/tailcat"
 )
+
+func TestClassifyTailcatAddrArg(t *testing.T) {
+	const addr = "tcomFwWCAAAQIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH2FpCg"
+	for _, tt := range []struct {
+		name, arg     string
+		wantAddr      string
+		wantDNS       string
+		wantErrSubstr string
+	}{
+		{"addr", addr, addr, "", ""},
+		{"DNS name", "server.example.com", "", "server.example.com", ""},
+		{"absolute DNS name", "server.example.com.", "", "server.example.com.", ""},
+		{"DNS name beginning with tc", "tc-server.example.com", "", "tc-server.example.com", ""},
+		{"addr with period", addr + ".", "", "", "refusing DNS lookup"},
+		{"addr as interior label", "prefix." + addr + ".example", "", "", "refusing DNS lookup"},
+		{"invalid DNS character", "server_name.example", "", "", "invalid character"},
+		{"empty DNS label", "server..example", "", "", "empty label"},
+		{"long DNS label", strings.Repeat("a", 64) + ".example", "", "", "longer than 63 bytes"},
+		{"neither", "not-an-address", "", "", "neither a valid tailcat address nor a DNS name"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			gotAddr, gotDNS, err := classifyTailcatAddrArg(tt.arg)
+			if string(gotAddr) != tt.wantAddr || gotDNS != tt.wantDNS {
+				t.Errorf("classifyTailcatAddrArg(%q) = %q, %q; want %q, %q", tt.arg, gotAddr, gotDNS, tt.wantAddr, tt.wantDNS)
+			}
+			if tt.wantErrSubstr == "" {
+				if err != nil {
+					t.Fatalf("classifyTailcatAddrArg(%q): %v", tt.arg, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.wantErrSubstr) {
+				t.Fatalf("classifyTailcatAddrArg(%q) error = %v; want error containing %q", tt.arg, err, tt.wantErrSubstr)
+			}
+		})
+	}
+}
 
 // TestHelpListsCommandTree verifies that the generated root help
 // mentions every subcommand and the global flags, the declarative
@@ -21,7 +57,7 @@ func TestHelpListsCommandTree(t *testing.T) {
 	help := ffhelp.Command(newRootCommand()).String()
 	for _, want := range []string{
 		"serve", "recv", "ping", "socks", "ssh", "cp", "parse", "resolve",
-		"genkey", "printpub", "version", "readme",
+		"forward", "genkey", "printpub", "version", "readme",
 		"--serve", "--key", "--derpmap-url",
 	} {
 		if !strings.Contains(help, want) {
@@ -58,6 +94,26 @@ func TestServeHelpListsServerFlags(t *testing.T) {
 	for _, want := range []string{"--allow", "--full-address", "--key"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("serve help is missing %q", want)
+		}
+	}
+}
+
+func TestParseFilesFlagWriteOnlyModes(t *testing.T) {
+	dir := t.TempDir()
+	for _, tt := range []struct {
+		suffix   string
+		wantMode tailcat.FileServeMode
+		wantName string
+	}{
+		{":wo", tailcat.FileServeWO, "flat write-only"},
+		{":wo+", tailcat.FileServeWOPlus, "recursive write-only"},
+	} {
+		fs, modeName, err := parseFilesFlag(dir + tt.suffix)
+		if err != nil {
+			t.Fatalf("parseFilesFlag(%q): %v", tt.suffix, err)
+		}
+		if fs.Dir != dir || fs.Mode != tt.wantMode || modeName != tt.wantName {
+			t.Errorf("parseFilesFlag(%q) = {%q, %v}, %q; want {%q, %v}, %q", tt.suffix, fs.Dir, fs.Mode, modeName, dir, tt.wantMode, tt.wantName)
 		}
 	}
 }
@@ -106,7 +162,7 @@ func TestServeSubcommand(t *testing.T) {
 // destination, so a remote command's own flags (here "-la") are
 // passed through rather than parsed.
 func TestSSHTrailingArgs(t *testing.T) {
-	root, err := parseCLI(t, "ssh", "-p", "2222", "user@tcblob", "ls", "-la")
+	root, err := parseCLI(t, "ssh", "-p", "2222", "user@tcaddr", "ls", "-la")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,16 +178,16 @@ func TestSSHTrailingArgs(t *testing.T) {
 		t.Errorf("-p = %q; want 2222", got)
 	}
 	got := sel.Flags.(*ff.FlagSet).GetArgs()
-	want := []string{"user@tcblob", "ls", "-la"}
+	want := []string{"user@tcaddr", "ls", "-la"}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("leftover args = %q; want %q", got, want)
 	}
 }
 
 // TestSocksTrailingArgs verifies that a child command's flags after
-// the address blob are left unparsed.
+// the tailcat address are left unparsed.
 func TestSocksTrailingArgs(t *testing.T) {
-	root, err := parseCLI(t, "socks", "--listen=1080", "tcblob", "curl", "--fail", "http://x/")
+	root, err := parseCLI(t, "socks", "--listen=1080", "tcaddr", "curl", "--fail", "http://x/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +196,7 @@ func TestSocksTrailingArgs(t *testing.T) {
 		t.Fatalf("selected command = %q; want socks", sel.Name)
 	}
 	got := sel.Flags.(*ff.FlagSet).GetArgs()
-	want := []string{"tcblob", "curl", "--fail", "http://x/"}
+	want := []string{"tcaddr", "curl", "--fail", "http://x/"}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("leftover args = %q; want %q", got, want)
 	}
@@ -151,8 +207,8 @@ func TestSocksTrailingArgs(t *testing.T) {
 // it (via flag set parenting).
 func TestGlobalFlagPlacement(t *testing.T) {
 	for _, args := range [][]string{
-		{"--key=new", "--derpmap-url=http://d/", "ping", "--timeout=5s", "tcblob"},
-		{"ping", "--key=new", "--derpmap-url=http://d/", "--timeout=5s", "tcblob"},
+		{"--key=new", "--derpmap-url=http://d/", "ping", "--timeout=5s", "tcaddr"},
+		{"ping", "--key=new", "--derpmap-url=http://d/", "--timeout=5s", "tcaddr"},
 	} {
 		if _, err := parseCLI(t, args...); err != nil {
 			t.Fatalf("parse %q: %v", args, err)
@@ -167,7 +223,7 @@ func TestGlobalFlagPlacement(t *testing.T) {
 }
 
 // TestHelpRequests verifies that -h, --help, and the help argument
-// all report ErrHelp instead of being treated as an address blob.
+// all report ErrHelp instead of being treated as a tailcat address.
 func TestHelpRequests(t *testing.T) {
 	for _, args := range [][]string{
 		{"-h"},
@@ -276,8 +332,29 @@ func TestGenkeyRequiresKeyName(t *testing.T) {
 	}
 }
 
+// TestForwardSubcommand verifies that forward parses its bind flag and
+// positional tailcat address and mappings without executing the listener.
+func TestForwardSubcommand(t *testing.T) {
+	root, err := parseCLI(t, "forward", "--bind=0.0.0.0", "tcaddr", "18080:8080", "9090")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel := root.GetSelected()
+	if sel.Name != "forward" {
+		t.Fatalf("selected command = %q; want forward", sel.Name)
+	}
+	got := sel.Flags.(*ff.FlagSet).GetArgs()
+	want := []string{"tcaddr", "18080:8080", "9090"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("leftover args = %q; want %q", got, want)
+	}
+	if f, ok := sel.Flags.GetFlag("bind"); !ok || f.GetValue() != "0.0.0.0" {
+		t.Errorf("--bind = %v; want 0.0.0.0", f)
+	}
+}
+
 // TestVersionSubcommand verifies that "tailcat version" dispatches to
-// the version subcommand rather than being treated as an address blob.
+// the version subcommand rather than being treated as a tailcat address.
 func TestVersionSubcommand(t *testing.T) {
 	root, err := parseCLI(t, "version")
 	if err != nil {
@@ -290,7 +367,7 @@ func TestVersionSubcommand(t *testing.T) {
 
 // TestUnknownArgSelectsRoot verifies that a non-subcommand first
 // argument still selects the root command, whose exec treats it as an
-// address blob in client pipe mode.
+// tailcat address in client pipe mode.
 func TestUnknownArgSelectsRoot(t *testing.T) {
 	root, err := parseCLI(t, "tcSOMEBLOB", "80")
 	if err != nil {
