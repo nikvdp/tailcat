@@ -69,7 +69,14 @@ Or build from source with a Go toolchain:
 $ go install github.com/tailscale/tailcat/cmd/tailcat@latest
 ```
 
-Or with Nix flakes, run it directly or install it:
+Or with Nix, from [nixpkgs](https://search.nixos.org/packages?channel=unstable&query=tailcat):
+
+```sh
+$ nix profile install nixpkgs#tailcat
+$ nix-env -iA nixpkgs.tailcat  # or with classic nix-env
+```
+
+Or with Nix flakes from this repo, run it directly or install it:
 
 ```sh
 $ nix run github:tailscale/tailcat
@@ -87,6 +94,17 @@ yay -S tailcat
 
 # OR install the binary release
 yay -S tailcat-bin
+```
+
+Or from conda-forge:
+
+[![tailcat on conda-forge](https://img.shields.io/conda/vn/conda-forge/tailcat?logo=conda-forge)](https://prefix.dev/channels/conda-forge/packages/tailcat)
+[![tailcat on conda-forge](https://img.shields.io/conda/pn/conda-forge/tailcat?logo=conda-forge)](https://prefix.dev/channels/conda-forge/packages/tailcat)
+
+```bash
+pixi global install tailcat
+# run without installation
+pixi exec tailcat
 ```
 
 ### Packaging from source
@@ -165,6 +183,19 @@ $ tailcat forward tcXXXXXXXXX 18080:8080 3306
 
 A local port of 0 asks the operating system for a free port; each listener prints its address once it's listening.
 
+To forward local ports to assets on the network reachable by an exit-node server, run the server in exit-node mode and specify each remote IP address and port in the mapping:
+
+```sh
+$ tailcat serve exit-node
+# 🐈 Server listening with new address: tcXXXXXXXXX
+
+$ tailcat forward tcXXXXXXXXX \
+    3001:172.23.52.30:3001 \
+    17170:172.23.52.31:17170
+```
+
+This forwards `127.0.0.1:3001` to `172.23.52.30:3001` and `127.0.0.1:17170` to `172.23.52.31:17170` through the exit-node server.
+
 By default, listeners bind to `127.0.0.1` and diagnostic logs are suppressed. Pass `--verbose` before the subcommand to enable verbose networking logs. Use `--bind=0.0.0.0` only when clients on other machines should be able to connect:
 
 ```sh
@@ -173,9 +204,33 @@ $ tailcat forward --bind=0.0.0.0 tcXXXXXXXXX 18080:8080
 
 Press Ctrl-C to stop forwarding.
 
+### Public-key-authenticated SSH server
+
+Run an SSH server that accepts keys from local `authorized_keys` files,
+literal OpenSSH public key lines, or GitHub accounts:
+
+```sh
+$ tailcat serve --ssh-authorized-keys=~/.ssh/authorized_keys ssh
+# 🐈 Server listening with new address: tcXXXXXXXXX
+```
+
+Multiple sources can be comma-separated. A `user@github` source fetches
+`https://github.com/user.keys` once, before the server starts:
+
+```sh
+$ tailcat serve --ssh-authorized-keys=bradfitz@github,./contractor.pub ssh
+```
+
+Every source must exist, fetch successfully, and contain valid public key
+lines or startup fails. Authorized-key options such as `command=` and
+`from=` are rejected because the built-in server does not implement them.
+Running `tailcat serve ssh` without `--ssh-authorized-keys` also fails; use the
+explicit `no-auth-ssh` service when the tunnel identity alone is sufficient.
+
 ### Auth-free SSH server
 
-On Linux and macOS, you can run an SSH server too with no auth. (If you want auth, you can just `tailcat serve 22` and proxy to your system SSH server)
+On Linux, macOS, and Windows, you can also explicitly run the SSH server with
+no client authentication. The encrypted tunnel provides the client identity.
 
 ```sh
 $ tailcat serve no-auth-ssh
@@ -229,8 +284,8 @@ The server confines all paths to the served directory (via Go's
 `os.Root`), so neither `..` nor symlinks escape it. The file service
 speaks SFTP, so the stock `sftp` and `scp` clients also work against
 it, given a ProxyCommand that pipes through tailcat (the same trick
-`tailcat cp` and `tailcat ssh` use). A `no-auth-ssh` server serves
-SFTP too, with the same access as the shell.
+`tailcat cp` and `tailcat ssh` use). Both `ssh` and `no-auth-ssh`
+servers serve SFTP too, with the same access as the shell.
 
 Transfers are not compressed: the SFTP protocol has no compression
 of its own, and the SSH transport here doesn't either (Go's SSH
@@ -317,8 +372,8 @@ A server can print the long self-contained form directly with the
 
 ## Key Management
 
-A server's tailcat address is derived from its WireGuard key, so
-the key you use determines who can reach you:
+A server's tailcat address contains its WireGuard public key and an independent
+WireGuard pre-shared key, so the saved key material determines who can reach you:
 
 * **Ephemeral keys (the default):** each server run generates a fresh key in
   memory and prints an address nobody has ever seen. When the process exits,
@@ -334,6 +389,11 @@ the key you use determines who can reach you:
 The CLI says at startup which kind it's using, so you know whether you're
 starting a fresh single-use server or re-listening on an address you may
 have shared in the past.
+
+WireGuard pre-shared keys are enabled by default and strongly recommended. For
+compatibility with tailcat clients v0.5.0 and earlier, `--psk=false` on `serve`
+or `genkey` produces shorter addresses, but removes post-quantum protection and
+protection from public DERP operators that observe the peers' public keys.
 
 ```sh
 $ tailcat genkey --key=default --region=nyc
@@ -532,6 +592,37 @@ $ ./client tcomFwWCAWf933BLELdzd3RkHiOufJ...
 hello from port 80
 ```
 
+UDP uses a connected packet connection for each client flow, preserving
+datagram boundaries and both endpoint addresses:
+
+```go
+s.OnUDP = func(port uint16) func(tailcat.ConnPacketConn) {
+	if port != 53 {
+		return nil
+	}
+	return func(c tailcat.ConnPacketConn) {
+		defer c.Close()
+		buf := make([]byte, tailcat.MaxUDPPayload)
+		for {
+			n, err := c.Read(buf)
+			if err != nil {
+				return
+			}
+			c.Write(buf[:n])
+		}
+	}
+}
+
+pc, err := cl.DialUDPPort(context.Background(), 53)
+```
+
+`ConnPacketConn` implements both `net.Conn` and `net.PacketConn`. Keep payloads
+at or below `tailcat.MaxUDPPayload` (1232 bytes) to fit the IPv6 tunnel MTU
+without fragmentation. Use `OnUDPForward` and `DialUDP` for exit-node traffic;
+`ProxyPacketConns` provides datagram-safe bidirectional forwarding. Inactive
+server-side UDP flows close after `tailcat.DefaultUDPIdleTimeout` (two minutes);
+set `Server.UDPIdleTimeout` to change the timeout.
+
 ## How it works
 
 ### Tailcat addresses
@@ -542,12 +633,19 @@ followed by base64-encoded [CBOR](https://cbor.io/) containing:
 
 - The server's WireGuard public key (Curve25519, 32 bytes)
 - A separate path-discovery public key (Curve25519, 32 bytes)
+- By default, an independent WireGuard pre-shared key (256 random bits),
+  which prevents a DERP operator that observes the peers' public keys from
+  joining the tunnel and provides post-quantum protection against recorded
+  traffic
 - DERP info. Either:
   1. a small integer referencing one of the default [Tailscale-run tailcat servers](https://tailcat.dev/derpmap.json), or
   2. full DERP server metadata, to either use a custom DERP server, or to avoid the client needing a potential round-trip to fetch the latest DERP map (the `tailcat serve --full-address` flag and the `tailcat resolve` subcommand produce this form)
 
-A typical tailcat address with just an integer region ID is around 95 bytes. With
-embedded DERP node details it's longer but self-contained.
+A typical tailcat address with just an integer region ID is around 140 bytes.
+With embedded DERP node details it's longer but self-contained.
+
+The default address is a secret bearer capability because it contains the
+pre-shared key. Share it only with clients that should be able to connect.
 
 ### Network stack
 
@@ -569,15 +667,17 @@ without the control plane.
 
 ### Connection flow
 
-1. **Server starts.** It generates (or loads) a WireGuard keypair,
-   connects to a DERP relay, and prints its tailcat address to stderr.
-   It then waits for clients.
+1. **Server starts.** It generates (or loads) a WireGuard keypair and, by
+   default, a pre-shared key, connects to a DERP relay, and prints its tailcat
+   address to stderr. It then waits for clients.
 
-2. **Client parses the tailcat address** to learn the server's public key and
-   path-discovery key, plus its DERP region. It generates its own ephemeral
-   keypair and connects to the same DERP relay. The separate path-discovery
-   key can appear in cleartext direct-path disco frames without revealing the
-   WireGuard public key that acts as the unlisted connection capability.
+2. **Client parses the tailcat address** to learn the server's public key,
+   path-discovery key, optional pre-shared key, and DERP region. It generates
+   its own ephemeral keypair and connects to the same DERP relay. The separate
+   path-discovery key can appear in cleartext direct-path disco frames without
+   revealing the WireGuard public key. The pre-shared key remains the secret
+   connection capability even when a relay operator observes both peers'
+   public keys.
 
 3. **Discovery handshake.** The client sends a "**Meow**" ping message
   to the server through the
@@ -586,10 +686,10 @@ without the control plane.
    network map, reconfigures the WireGuard engine, and replies with a
    "**Meowed**" acknowledgment.
 
-4. **WireGuard tunnel.** With both sides configured as WireGuard
-   peers, the standard WireGuard handshake proceeds (routed through
-   DERP initially). Once complete, the tunnel is up and encrypted
-   traffic can flow.
+4. **WireGuard tunnel.** With both sides configured as WireGuard peers using
+   the address's pre-shared key when present, the WireGuard handshake proceeds
+   (routed through DERP initially). Once complete, the tunnel is up and
+   encrypted traffic can flow.
 
 5. **NAT traversal.** In parallel, each side advertises its UDP
    endpoints (public IP:port learned via STUN, plus local interface
