@@ -1,27 +1,11 @@
 name: Release
 
-# This fork tracks upstream main and publishes binaries for platforms
-# upstream doesn't cover. Two jobs:
-#
-#   sync      -> snapshot upstream main, overlay our release files
-#   release   -> build+publish, only for upstream releases we lack
-#
-# No container images are built; see .goreleaser.yaml, which has no
-# dockers_v2 section.
-#
-# GITHUB_TOKEN cannot create or update workflow files, and upstream
-# often touches .github/workflows. Rebasing those commits onto this
-# fork is therefore impossible without a PAT. Instead, sync writes
-# one fast-forward commit: upstream's tree plus this fork's
-# .github/workflows and .goreleaser.yaml. Those paths do not change
-# in the push, so the default token is enough.
+# Rebase this fork onto upstream daily, then build missing upstream releases.
+# Keep the fork's workflow files unchanged so sync can use GITHUB_TOKEN.
 on:
-  # Any push to main (including sync's own snapshot) re-evaluates
-  # both jobs; the bot push itself skips sync to avoid a loop.
   push:
     branches: [main]
-  # Public repos have scheduled workflows auto-disabled after 60 days
-  # without repository activity; any push revives them.
+  # GitHub may disable scheduled workflows after 60 days of inactivity.
   schedule:
     - cron: "17 6 * * *"
   workflow_dispatch:
@@ -32,10 +16,7 @@ on:
           every unbuilt upstream release, oldest first.
         required: false
 
-# One publisher at a time. A push (from git push, or from sync's own
-# snapshot) already runs this workflow; dispatching at the same time
-# builds the same missing tag twice and the loser dies on
-# already_exists asset uploads.
+# Serialize sync and publishing; never cancel a release mid-upload.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -43,8 +24,7 @@ permissions:
   contents: write
 
 jobs:
-  # Keep main as: upstream's tree + this fork's release files.
-  # Fast-forward only; never force-push.
+  # Preserve fork commits and upstream ancestry, not just upstream's file tree.
   sync:
     if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
@@ -60,27 +40,58 @@ jobs:
       - name: fetch upstream
         run: git fetch upstream main
 
-      - name: overlay fork files onto upstream
+      - name: rebase onto upstream main
+        id: rebase
+        env:
+          GIT_EDITOR: "true"
         run: |
           set -euo pipefail
+          before=$(git rev-parse HEAD)
+          echo "before=$before" >> "$GITHUB_OUTPUT"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git read-tree upstream/main
-          git rm -r --cached --ignore-unmatch --force .github/workflows >/dev/null
-          # HEAD is still this fork's main: read-tree only swapped the
-          # index. Restore our workflow files and GoReleaser config so
-          # the pushed tree does not create or update them.
-          git restore --source=HEAD --staged -- .github/workflows .goreleaser.yaml
-          tree=$(git write-tree)
-          if [ "$tree" = "$(git rev-parse 'HEAD^{tree}')" ]; then
-            echo "Already synced to upstream $(git rev-parse --short upstream/main)."
-            exit 0
+          # Only workflow conflicts may be resolved automatically: these
+          # files must remain identical to the fork's pre-rebase versions.
+          command=(git rebase upstream/main)
+          until "${command[@]}"; do
+            mapfile -d '' -t conflicts < <(git diff --name-only --diff-filter=U -z)
+            if [ "${#conflicts[@]}" -eq 0 ]; then
+              echo "::error::Rebase failed; see Git's error above. Nothing pushed."
+              git rebase --abort
+              exit 1
+            fi
+            for path in "${conflicts[@]}"; do
+              case "$path" in
+                .github/workflows/*) ;;
+                *)
+                  echo "::error::Rebase conflict outside workflows: $path. Nothing pushed."
+                  git rebase --abort
+                  exit 1
+                  ;;
+              esac
+            done
+            git restore --source="$before" --staged --worktree -- .github/workflows
+            if git diff --cached --quiet; then
+              command=(git rebase --skip)
+            else
+              command=(git rebase --continue)
+            fi
+          done
+
+          git restore --source="$before" --staged --worktree -- .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: retain fork workflows after upstream rebase"
           fi
 
-          msg="sync: tailscale/tailcat $(git rev-parse --short upstream/main)"
-          commit=$(git commit-tree "$tree" -p HEAD -m "$msg")
-          git push origin "$commit":refs/heads/main
+      - name: verify and push rebase
+        env:
+          BEFORE: ${{ steps.rebase.outputs.before }}
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor upstream/main HEAD
+          git diff --exit-code "$BEFORE" HEAD -- .github/workflows
+          git push --force-with-lease="refs/heads/main:$BEFORE" origin HEAD:refs/heads/main
 
   # Build and publish upstream releases this fork doesn't have yet.
   # Gated on upstream's releases, not on upstream's commits: upstream
@@ -88,8 +99,7 @@ jobs:
   # releases should produce artifacts here.
   release:
     needs: sync
-    # Skip if sync failed (a failed overlay leaves main stale, and
-    # building that tree would ship the wrong code).
+    # A failed sync must not publish a release.
     if: needs.sync.result == 'success'
     runs-on: ubuntu-latest
     steps:
