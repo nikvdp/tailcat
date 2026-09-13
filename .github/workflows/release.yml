@@ -1,34 +1,199 @@
 name: Release
 
+# Rebase this fork onto upstream daily, then build missing upstream releases.
+# Keep the fork's workflow files unchanged so sync can use GITHUB_TOKEN.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  # GitHub may disable scheduled workflows after 60 days of inactivity.
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: >-
+          Upstream release to build (e.g. v0.3.0). Leave empty to build
+          every unbuilt upstream release, oldest first.
+        required: false
 
+# Serialize sync and publishing; never cancel a release mid-upload.
+concurrency:
+  group: release
+  cancel-in-progress: false
 permissions:
   contents: write
-  packages: write # to push container images to ghcr.io
 
 jobs:
-  goreleaser:
+  # Preserve fork commits and upstream ancestry, not just upstream's file tree.
+  sync:
+    if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0 # for the changelog
+          ref: main
+          fetch-depth: 0
+
+      - name: add upstream remote
+        run: git remote add upstream https://github.com/tailscale/tailcat
+
+      - name: fetch upstream
+        run: git fetch upstream main
+
+      - name: rebase onto upstream main
+        id: rebase
+        env:
+          GIT_EDITOR: "true"
+        run: |
+          set -euo pipefail
+          before=$(git rev-parse HEAD)
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Only workflow conflicts may be resolved automatically: these
+          # files must remain identical to the fork's pre-rebase versions.
+          command=(git rebase upstream/main)
+          until "${command[@]}"; do
+            mapfile -d '' -t conflicts < <(git diff --name-only --diff-filter=U -z)
+            if [ "${#conflicts[@]}" -eq 0 ]; then
+              echo "::error::Rebase failed; see Git's error above. Nothing pushed."
+              git rebase --abort
+              exit 1
+            fi
+            for path in "${conflicts[@]}"; do
+              case "$path" in
+                .github/workflows/*) ;;
+                *)
+                  echo "::error::Rebase conflict outside workflows: $path. Nothing pushed."
+                  git rebase --abort
+                  exit 1
+                  ;;
+              esac
+            done
+            git restore --source="$before" --staged --worktree -- .github/workflows
+            if git diff --cached --quiet; then
+              command=(git rebase --skip)
+            else
+              command=(git rebase --continue)
+            fi
+          done
+
+          git restore --source="$before" --staged --worktree -- .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: retain fork workflows after upstream rebase"
+          fi
+
+      - name: verify and push rebase
+        env:
+          BEFORE: ${{ steps.rebase.outputs.before }}
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor upstream/main HEAD
+          git diff --exit-code "$BEFORE" HEAD -- .github/workflows
+          git push --force-with-lease="refs/heads/main:$BEFORE" origin HEAD:refs/heads/main
+
+  # Build and publish upstream releases this fork doesn't have yet.
+  # Gated on upstream's releases, not on upstream's commits: upstream
+  # merges to main far more often than it cuts a release, and only
+  # releases should produce artifacts here.
+  release:
+    needs: sync
+    # A failed sync must not publish a release.
+    if: needs.sync.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      # GoReleaser's dockers_v2 needs a buildx builder with the
-      # docker-container driver to build multi-arch images.
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           version: "~> v2"
-          args: release --clean
+          install-only: true
+
+      - name: find unbuilt upstream releases
+        id: pending
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WANTED: ${{ github.event.inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          have=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
+                   --json tagName --jq '.[].tagName')
+          all=$(gh release list --repo tailscale/tailcat --limit 200 \
+                  --json tagName,isDraft,isPrerelease \
+                  --jq '.[] | select(.isDraft == false and .isPrerelease == false) | .tagName')
+          if [ -n "${WANTED:-}" ]; then
+            if ! echo "$all" | grep -Fxq "$WANTED"; then
+              echo "::error::upstream has no final release $WANTED"
+              exit 1
+            fi
+            all="$WANTED"
+          fi
+          # comm needs sorted input; -13 keeps upstream-only tags.
+          # Unsorted upstream order, so emit oldest-listed last.
+          pending=$(comm -13 <(echo "$have" | sort) <(echo "$all" | sort))
+          if [ -z "$pending" ]; then
+            echo "tags=" >> "$GITHUB_OUTPUT"
+            echo "No new upstream releases to build."
+            exit 0
+          fi
+          echo "Unbuilt upstream releases: $(echo "$pending" | tr '\n' ' ')"
+          {
+            echo "tags<<TAGS_EOF"
+            echo "$pending"
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: build each pending release
+        if: steps.pending.outputs.tags != ''
+        env:
+          # gh reads GH_TOKEN; goreleaser reads GITHUB_TOKEN and fails
+          # outright without it ("missing GITHUB_TOKEN, GITLAB_TOKEN
+          # and GITEA_TOKEN"), so both are needed here.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "=== building upstream $tag ==="
+            # Resolve the tagged commit, then fetch it. A shallow
+            # fetch keeps the run fast; the build needs no history.
+            sha=$(gh api "repos/tailscale/tailcat/commits/$tag" --jq '.sha')
+            git fetch --depth 1 https://github.com/tailscale/tailcat "$sha"
+            git checkout --force "$sha"
+            # Overlay this fork's release config on upstream's release
+            # code. "origin" here is wherever actions/checkout pointed,
+            # and the fork's config lives on its own main, so fetch it
+            # explicitly rather than assuming a local branch exists.
+            git fetch --depth 1 origin main
+            git checkout FETCH_HEAD -- .goreleaser.yaml
+
+            # A detached checkout has no tag history for the changelog,
+            # and GoReleaser's would come out empty, so write notes.
+            {
+              echo "Mirrored build of upstream [$tag](https://github.com/tailscale/tailcat/releases/tag/$tag)."
+              echo
+              echo "Built from upstream commit \`$sha\` with this fork's"
+              echo "[\`.goreleaser.yaml\`](https://github.com/$GITHUB_REPOSITORY/blob/main/.goreleaser.yaml),"
+              echo "which adds release targets upstream does not publish"
+              echo "(macOS, FreeBSD, OpenBSD, Linux riscv64). The Linux"
+              echo "and Windows binaries match upstream's; the rest are"
+              echo "additions, not re-builds."
+              echo
+              echo "See the [upstream release](https://github.com/tailscale/tailcat/releases/tag/$tag)"
+              echo "for the changelog."
+            } > /tmp/notes.md
+
+            # GORELEASER_CURRENT_TAG makes GoReleaser treat the tree as
+            # upstream's tag, so artifact names and the embedded
+            # --version match upstream instead of a snapshot hash.
+            GORELEASER_CURRENT_TAG="$tag" \
+              goreleaser release --clean --skip=validate \
+                --release-notes=/tmp/notes.md
+          done <<< "${{ steps.pending.outputs.tags }}"

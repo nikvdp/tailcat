@@ -1,0 +1,101 @@
+name: Rebase token probe
+
+on:
+  push:
+    branches: [token-rebase-probe]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: token-rebase-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: github.repository == 'nikvdp/tailcat' && github.ref == 'refs/heads/token-rebase-probe'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: require a real upstream workflow update
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/tailscale/tailcat
+          git fetch --no-tags upstream main
+          base=16efa8c299b8c79e9650bf4f3275e954d43ab3f6
+          git merge-base --is-ancestor "$base" HEAD
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "::error::This probe must start behind upstream; refusing a no-op test."
+            exit 1
+          fi
+          if git diff --quiet "$base" upstream/main -- .github/workflows; then
+            echo "::error::Upstream has no workflow changes to exercise."
+            exit 1
+          fi
+
+      - name: run the proposed production rebase script
+        id: rebase
+        env:
+          GIT_EDITOR: "true"
+        run: |
+          set -euo pipefail
+          before=$(git rev-parse HEAD)
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Only workflow conflicts may be resolved automatically: these
+          # files must remain identical to the fork's pre-rebase versions.
+          command=(git rebase upstream/main)
+          until "${command[@]}"; do
+            mapfile -d '' -t conflicts < <(git diff --name-only --diff-filter=U -z)
+            if [ "${#conflicts[@]}" -eq 0 ]; then
+              echo "::error::Rebase failed; see Git's error above. Nothing pushed."
+              git rebase --abort
+              exit 1
+            fi
+            for path in "${conflicts[@]}"; do
+              case "$path" in
+                .github/workflows/*) ;;
+                *)
+                  echo "::error::Rebase conflict outside workflows: $path. Nothing pushed."
+                  git rebase --abort
+                  exit 1
+                  ;;
+              esac
+            done
+            git restore --source="$before" --staged --worktree -- .github/workflows
+            if git diff --cached --quiet; then
+              command=(git rebase --skip)
+            else
+              command=(git rebase --continue)
+            fi
+          done
+
+          git restore --source="$before" --staged --worktree -- .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: retain fork workflows after upstream rebase"
+          fi
+
+      - name: verify and push only the probe branch
+        env:
+          BEFORE: ${{ steps.rebase.outputs.before }}
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor upstream/main HEAD
+          git diff --exit-code "$BEFORE" HEAD -- .github/workflows
+          git diff --exit-code upstream/main HEAD -- . ':(exclude).github/workflows'
+          if git merge-base --is-ancestor "$BEFORE" HEAD; then
+            echo "::error::Probe did not rewrite history; refusing an inconclusive test."
+            exit 1
+          fi
+          git push --force-with-lease="refs/heads/token-rebase-probe:$BEFORE" \
+            origin HEAD:refs/heads/token-rebase-probe
+          remote=$(git ls-remote --exit-code origin refs/heads/token-rebase-probe | cut -f1)
+          test "$remote" = "$(git rev-parse HEAD)"
+          echo "PASS: GITHUB_TOKEN pushed rebased history with unchanged workflow files."
+          echo "PASS: GITHUB_TOKEN pushed rebased history with unchanged workflow files." >> "$GITHUB_STEP_SUMMARY"
