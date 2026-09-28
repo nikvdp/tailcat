@@ -25,7 +25,7 @@ func skipIfTailscaleCI(t *testing.T) {
 
 // TestReleaseTagsInSync asserts that the checked-in build-tags.txt
 // file (the entrypoint for third-party packagers) and the -tags= line
-// in .goreleaser.yaml both carry exactly the tags ReleaseTags
+// in .goreleaser.fork.yaml both carry exactly the tags ReleaseTags
 // returns. It reads the yaml as plain text on purpose: the repo has
 // no YAML dependency and an exact substring match is all that is
 // needed. Regenerate both with: go run ./internal/buildtags/printtags
@@ -45,14 +45,14 @@ func TestReleaseTagsInSync(t *testing.T) {
 		t.Errorf("build-tags.txt content is stale; %s\n got: %s\nwant: %s", regen, got, want)
 	}
 
-	yml, err := os.ReadFile("../../.goreleaser.yaml")
+	yml, err := os.ReadFile("../../.goreleaser.fork.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := "-tags=" + ReleaseTags(); !strings.Contains(string(yml), want) {
-		t.Errorf(".goreleaser.yaml does not contain %q; %s", want, regen)
+		t.Errorf(".goreleaser.fork.yaml does not contain %q; %s", want, regen)
 	}
 	if n := strings.Count(string(yml), "-tags="); n != 1 {
-		t.Errorf(".goreleaser.yaml contains %d \"-tags=\" occurrences; want exactly 1", n)
+		t.Errorf(".goreleaser.fork.yaml contains %d \"-tags=\" occurrences; want exactly 1", n)
 	}
 }
