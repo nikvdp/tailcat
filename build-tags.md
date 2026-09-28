@@ -39,7 +39,7 @@ copied into two places:
 * **build-tags.txt**: the file described above, for packagers and for
   the CI job that cross-builds every release target
   ([.github/workflows/test.yml](./.github/workflows/test.yml)).
-* **.goreleaser.yaml**: a `-tags=` line in the `flags` of the release
+* **.goreleaser.fork.yaml**: a `-tags=` line in the `flags` of the release
   build, since GoReleaser cannot read the list from a file.
 
 A test, [internal/buildtags/sync_test.go](./internal/buildtags/sync_test.go),
