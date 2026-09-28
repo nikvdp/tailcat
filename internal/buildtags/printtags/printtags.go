@@ -3,7 +3,7 @@
 
 // Command printtags prints the build tag list for native builds of
 // cmd/tailcat. It regenerates the checked-in build-tags.txt file and
-// the -tags= line in .goreleaser.yaml, both of which a test in
+// the -tags= line in .goreleaser.fork.yaml, both of which a test in
 // internal/buildtags keeps in sync.
 package main
 

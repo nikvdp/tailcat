@@ -64,7 +64,7 @@ func WasmTags() string {
 
 // ReleaseTags returns the comma-joined -tags value for native builds
 // of cmd/tailcat. It must match the checked-in build-tags.txt file
-// and the -tags= line in .goreleaser.yaml; a test enforces both.
+// and the -tags= line in .goreleaser.fork.yaml; a test enforces both.
 func ReleaseTags() string {
 	return tags(releaseKeep)
 }
