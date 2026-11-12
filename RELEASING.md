@@ -67,3 +67,23 @@ the container images are built into the local Docker daemon as
 separate per-platform tags rather than a multi-arch manifest, and
 nothing is pushed. Building them requires a buildx builder with the
 docker-container driver (`docker buildx create --use`).
+
+## Fork synchronization
+
+In `nikvdp/tailcat`, the Release workflow first rebases the fork onto
+`tailscale/tailcat`'s `main`, then builds any missing upstream releases
+with `.goreleaser.fork.yaml`. Mirrored releases publish automatically;
+the manual draft-release process above describes upstream releases.
+
+Sync preserves the fork's workflow files, including intentional
+deletions. If upstream modifies a workflow the fork deleted (such as
+`nix.yml`), the conflict handler removes that path before restoring
+the remaining workflows. Conflicts in `.goreleaser.fork.yaml` also
+retain the fork's pre-rebase version; `.goreleaser.yaml` follows
+upstream. Application-code conflicts still abort sync and block
+publishing; they require manual resolution.
+
+The sync job verifies that workflows and `.goreleaser.fork.yaml` are
+unchanged before pushing with an exact-commit lease. Diagnose sync
+failures in the `rebase onto upstream main` step before investigating
+GoReleaser: the release job does not run when sync fails.
